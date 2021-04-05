@@ -11,6 +11,8 @@ use warnings;
 use IO::File;
 use Data::Dumper;
 
+our $file_id;
+our @metrics;
 our %metric_idx;
 our @stored_sample;
 our @num_written_samples;
@@ -18,8 +20,8 @@ our @interval;
 our $total_logged_samples;
 our $total_cons_samples;
 our %inter_sample_interval;
-my $use_xz = 1;
-my $metric_data_fh;
+our $use_xz = 1;
+our $metric_data_fh;
 
 sub write_sample {
     my $idx = shift;
@@ -58,7 +60,6 @@ sub get_metric_label {
 }
 
 sub finish_samples {
-    my $metrics_ref = shift;
     my @new_metrics;
     my $num_deletes = 0;
     # All of the stored samples need to be written
@@ -71,11 +72,11 @@ sub finish_samples {
                     # TODO: This optimization might be better if the metric source/type could opt in/out of this.
                     # There might be certain metrics which users want to query and get a "0" instead of a metric
                     # not existing.  FWIW, this should *not* be a problem for metric-aggregation for throughput class.
-                    $$metrics_ref[$idx]{'purge'} = 1;
+                    $metrics[$idx]{'purge'} = 1;
                     $num_deletes++;
                 } else {
                     write_sample($idx, $stored_sample[$idx]{'begin'}, $stored_sample[$idx]{'end'}, $stored_sample[$idx]{'value'});
-                    $$metrics_ref[$idx]{'idx'} = $idx;
+                    $metrics[$idx]{'idx'} = $idx;
                 }
             } else {
                 printf "ERROR: No stored sample defined at index %d\n", $idx;
@@ -89,20 +90,25 @@ sub finish_samples {
         printf "finish_samples(): cannot close file with undefined file handle\n";
         exit 1;
     }
-    for (my $idx = 0; $idx < scalar @$metrics_ref; $idx++) {
-        next if (defined $$metrics_ref[$idx]{'purge'} and $$metrics_ref[$idx]{'purge'} == 1);
+    for (my $idx = 0; $idx < scalar @metrics; $idx++) {
+        next if (defined $metrics[$idx]{'purge'} and $metrics[$idx]{'purge'} == 1);
         my %metric;
-        $metric{'idx'} = $$metrics_ref[$idx]{'idx'};
-        $metric{'desc'} = $$metrics_ref[$idx]{'desc'};
-        $metric{'names'} = $$metrics_ref[$idx]{'names'};
+        $metric{'idx'} = $metrics[$idx]{'idx'};
+        $metric{'desc'} = $metrics[$idx]{'desc'};
+        $metric{'names'} = $metrics[$idx]{'names'};
         push(@new_metrics, \%metric);
     }
-    return \@new_metrics;
+    if (scalar @new_metrics > 0) {
+        my $coder = JSON::XS->new;
+        my $file = "metric-data-" . $file_id . ".json.xz";
+        my $json_fh = new IO::Compress::Xz $file || die("Could not open " . $file . " for writing\n");
+        print $json_fh $coder->encode(\@new_metrics);
+        close($json_fh);
+    }
 }
 
 sub log_sample {
-    my $file_id = shift;
-    my $metrics_ref = shift;
+    $file_id = shift;
     my $type = shift;
     my $desc_ref = shift;
     my $names_ref = shift;
@@ -116,14 +122,14 @@ sub log_sample {
     my $label = get_metric_label($desc_ref, $names_ref);
 
     if (! exists $metric_idx{$label}) { # This is the first sample for this metric type (of this label)
-        # This is how we track which element in the metrics_ref array belongs to this metric type
-        $metric_idx{$label} = scalar @$metrics_ref;
+        # This is how we track which element in the metrics array belongs to this metric type
+        $metric_idx{$label} = scalar @metrics;
         my $idx = $metric_idx{$label};
         # store the metric_desc info
         my %this_metric;
         $this_metric{'desc'} = $desc_ref;
         $this_metric{'names'} = $names_ref;
-        $$metrics_ref[$idx] = \%this_metric;
+        $metrics[$idx] = \%this_metric;
         # Sample data will not be accumulated in a hash or array, as the memory usage
         # of this script can explode.  Instead, samples are written to a file (but we
         # also merge cronologically adjacent samples with the same valule).
