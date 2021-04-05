@@ -9,6 +9,7 @@ our @EXPORT = qw(log_sample finish_samples);
 use strict;
 use warnings;
 use IO::File;
+use Data::Dumper;
 
 our %metric_idx;
 our @stored_sample;
@@ -18,7 +19,6 @@ our $total_logged_samples;
 our $total_cons_samples;
 our %inter_sample_interval;
 my $use_xz = 1;
-my $metric_data_file = "metric-data.csv";
 my $metric_data_fh;
 
 sub write_sample {
@@ -26,10 +26,12 @@ sub write_sample {
     my $begin = shift;
     my $end = shift;
     my $value = shift;
-    if ($value > 0) {
-        printf "%d,%d,%d,%f\n", $idx, $begin, $end, $value;
+    if (defined $metric_data_fh) {
+        printf { $metric_data_fh } "%d,%d,%d,%f\n", $idx, $begin, $end, $value;
+    } else {
+        print "Cannot write sample with undefined file handle\n";
+        exit 1;
     }
-    printf { $metric_data_fh } "%d,%d,%d,%f\n", $idx, $begin, $end, $value;
     if (defined $num_written_samples[$idx]) {
         $num_written_samples[$idx]++;
     } else {
@@ -57,40 +59,56 @@ sub get_metric_label {
 
 sub finish_samples {
     my $metrics_ref = shift;
-    my $num_splices = 0;
-    printf "num_metrics: %d\n", scalar @$metrics_ref;
-    printf "num_stored_samples: %d\n", scalar @stored_sample;
+    my @new_metrics;
+    my $num_deletes = 0;
     # All of the stored samples need to be written
     for (my $idx = 0; $idx < scalar @stored_sample; $idx++) {
-        if (defined $metric_data_fh and defined $stored_sample[$idx]) {
-            if ($stored_sample[$idx]{'value'} == 0 and ! defined $num_written_samples[$idx]) {
-                # This metric had only 1 sample and the value is 0, so it "did not do any work".  Therefore, we can just
-                # not create this metric at all.
-                # TODO: This optimization might be better if the metric source/type could opt in/out of this.
-                # There might be certain metrics which users want to query and get a "0" instead of a metric
-                # not existing.  FWIW, this should *not* be a problem for metric-aggregation for throughput class.
-                printf "deleting metric because only sample is 0 at idx: %d (modified idx): %d label: %s\n",
-                       $idx, $idx - $num_splices, get_metric_label($metrics_ref, $$metrics_ref[$idx - $num_splices]{'names'});
-                splice(@$metrics_ref, $idx - $num_splices, 1);
-                $num_splices++;
+        if (defined $metric_data_fh) {
+            if (defined $stored_sample[$idx]) {
+                if ($stored_sample[$idx]{'value'} == 0 and ! defined $num_written_samples[$idx]) {
+                    # This metric has only 1 sample and the value is 0, so it "did not do any work".  Therefore, we can just
+                    # not create this metric at all.
+                    # TODO: This optimization might be better if the metric source/type could opt in/out of this.
+                    # There might be certain metrics which users want to query and get a "0" instead of a metric
+                    # not existing.  FWIW, this should *not* be a problem for metric-aggregation for throughput class.
+                    $$metrics_ref[$idx]{'purge'} = 1;
+                    $num_deletes++;
+                } else {
+                    write_sample($idx, $stored_sample[$idx]{'begin'}, $stored_sample[$idx]{'end'}, $stored_sample[$idx]{'value'});
+                    $$metrics_ref[$idx]{'idx'} = $idx;
+                }
             } else {
-                write_sample($idx, $stored_sample[$idx]{'begin'}, $stored_sample[$idx]{'end'}, $stored_sample[$idx]{'value'});
-                $$metrics_ref[$idx - $num_splices]{'idx'} = $idx;
+                printf "ERROR: No stored sample defined at index %d\n", $idx;
+                exit 1;
             }
         }
     }
-    close($metric_data_fh);
-    printf "num_deletes: %d\n", $num_splices;
+    if (defined $metric_data_fh) {
+        close($metric_data_fh);
+    } else {
+        printf "finish_samples(): cannot close file with undefined file handle\n";
+        exit 1;
+    }
+    for (my $idx = 0; $idx < scalar @$metrics_ref; $idx++) {
+        next if (defined $$metrics_ref[$idx]{'purge'} and $$metrics_ref[$idx]{'purge'} == 1);
+        my %metric;
+        $metric{'idx'} = $$metrics_ref[$idx]{'idx'};
+        $metric{'desc'} = $$metrics_ref[$idx]{'desc'};
+        $metric{'names'} = $$metrics_ref[$idx]{'names'};
+        push(@new_metrics, \%metric);
+    }
+    return \@new_metrics;
 }
 
 sub log_sample {
+    my $file_id = shift;
     my $metrics_ref = shift;
     my $type = shift;
     my $desc_ref = shift;
     my $names_ref = shift;
     my $end = shift;
     my $value = shift;
-    my $label = "";
+    my $metric_data_file = "metric-data-" . $file_id . ".csv";
     if ($use_xz == 1) {
         $metric_data_file .= ".xz";
     }
@@ -112,23 +130,24 @@ sub log_sample {
         # Check for and open this file now.
         if (! defined $metric_data_fh) {
             if ($use_xz == "1") {
-                $metric_data_fh = IO::Compress::Xz->new($metric_data_file, Preset => 0) || die("Could not open " . $metric_data_file . " for writing: $!");
+                $metric_data_fh = new IO::Compress::Xz $metric_data_file || die("Could not open " . $metric_data_file . " for writing\n");
             } else {
                 open( $metric_data_fh, '>' . $metric_data_file) or die("Could not open " . $metric_data_file . ": $!");
             }
-            printf "opened %s\n", $metric_data_file;
         }
         $stored_sample[$idx]{'end'} = $end;
         $stored_sample[$idx]{'value'} = $value;
         return;
-    } else { 
+    } else {  # This is mot the first sample for this metric_type (of this label)
         my $idx = $metric_idx{$label};
         # Figure out what the typical duration is between samples from the first two
+        # (This should only be triggered on the second sample)
         if (! defined $interval[$idx] and defined $stored_sample[$idx]{'end'}) {
-            $interval[$idx] = $end - $stored_sample[$idx]{'end'}
+            $interval[$idx] = $end - $stored_sample[$idx]{'end'};
         }
-        # If this is the very first sample, we can't get a begin from a previous sample's end+1, so we
-        # derive the begin by subtracting the interval from current sample's end.
+        # If this is the very first sample (that is written), we can't get a begin
+        # from a previous sample's end+1, so we derive the begin by subtracting the
+        # interval from current sample's end.
         if (defined $stored_sample[$idx] and ! defined $stored_sample[$idx]{'begin'}) {
             $stored_sample[$idx]{'begin'} = $stored_sample[$idx]{'end'} - $interval[$idx];
         }
@@ -146,13 +165,8 @@ sub log_sample {
             $stored_sample[$idx]{'end'} = $end;
         }
         $total_logged_samples++;
-        # Flush every so often in an attempt to reduce memory usage
-        # (not sure if this is making a difference)
         if ($total_logged_samples % 1000000 == 0) {
             printf "Logged %d samples, wrote %d consolidated samples\n", $total_logged_samples, $total_cons_samples;
-            if ($use_xz == 1) {
-                $metric_data_fh->flush;
-            }
         }
     }
 }
